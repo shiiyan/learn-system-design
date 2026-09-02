@@ -91,7 +91,7 @@ Clarify measurable targets rather than saying “fast” or “highly available.
 
 - Unsafe, removed, expired, or blocked content must not be returned.
 - One pagination session has a stable order and does not return duplicates.
-- A ranker failure must not make the feed unavailable.
+- A Ranking Service failure must not make the feed unavailable.
 - Explicit negative feedback must override cached recommendation quality.
 
 ### End Step 1 with an agreed requirements summary
@@ -132,6 +132,19 @@ Ask: **“Does this scope and requirement summary look right before I propose th
 
 The high-level design is a logical backend architecture, not a cloud-deployment diagram. Show clients, services, storage roles, synchronous calls, asynchronous boundaries, and the three core flows.
 
+### Component naming convention
+
+Use names that reveal both responsibility and runtime role:
+
+- **`... Service`** — an independently deployed component serving synchronous requests, such as `Feed Service`, `Candidate Generation Service`, and `Ranking Service`.
+- **`... Worker`** — an asynchronous event consumer or background processor, such as `User Feature Update Worker`.
+- **`... Pipeline` or `... Job`** — an offline or scheduled workflow, such as `Model Training Pipeline`.
+- **`... Module`** — logic that stays inside a service process, such as `Feed Policy Module` inside the `Feed Service`.
+- **`... Store`, `... Cache`, or `... Registry`** — persisted or cached data, not executable services.
+- Keep standard infrastructure names such as `CDN`, `Load Balancer`, `DNS`, and `Event Stream`.
+
+Do not append `Service` to every box. Use it consistently only for actual service boundaries; otherwise the diagram hides important synchronous, asynchronous, and storage distinctions.
+
 ### Prefer one focused diagram per core flow
 
 Do not force all components into one giant diagram. Draw one small diagram for each functional workflow, then connect the diagrams through named shared data or services:
@@ -147,14 +160,14 @@ This keeps each end-to-end path explainable while still showing how the whole sy
 ```mermaid
 flowchart LR
     Publisher --> Ingestion[Ingestion Service]
-    Ingestion --> Processing[Content Processing]
-    Processing --> Metadata[(Content Metadata)]
-    Processing --> Blob[(Object Storage)]
-    Processing --> Gate[Safety, Quality and Dedup Gate]
-    Gate -->|ACTIVE article event| Builder[Candidate and Feature Builder]
-    Builder --> Pools[(Candidate Pools)]
-    Builder --> Features[(Content Features)]
-    Gate -->|remove or takedown| Invalidation[Invalidation Event]
+    Ingestion --> Processing[Content Processing Service]
+    Processing --> Metadata[(Content Metadata Store)]
+    Processing --> Blob[(Media Object Store)]
+    Processing --> Gate[Safety and Quality Service]
+    Gate -->|ACTIVE article event| Builder[Candidate and Feature Update Worker]
+    Builder --> Pools[(Candidate Pool Store)]
+    Builder --> Features[(Content Feature Store)]
+    Gate -->|remove or takedown event| Invalidation[Content Invalidation Worker]
     Invalidation --> Metadata
     Invalidation --> Pools
 ```
@@ -176,22 +189,22 @@ flowchart LR
     Edge --> LB[Load Balancer]
     LB --> Feed[Feed Service]
     Feed <--> Session[(Feed Session Cache)]
-    Feed -->|new session| Generator[Candidate Generator]
-    Pools[(Candidate Pools)] --> Generator
+    Feed -->|new session| Generator[Candidate Generation Service]
+    Pools[(Candidate Pool Store)] --> Generator
     UserFeatures[(User Feature Store)] --> Generator
-    Generator --> Ranker[Online Ranker]
+    Generator --> Ranker[Ranking Service]
     UserFeatures --> Ranker
     ContentFeatures[(Content Feature Store)] --> Ranker
-    Ranker --> Rules[Eligibility and Slate Rules]
+    Ranker --> Rules[Feed Policy Module in Feed Service]
     Preferences[(Preference Store)] --> Rules
     Rules --> Session
-    Rules --> Metadata[(Content Metadata)]
+    Rules --> Metadata[(Content Metadata Store)]
     Metadata -->|hydrate current page| Feed
     Feed -->|response through edge path| Client
-    Feed -. ranker timeout .-> Popular[(Regional Popular Feed)]
+    Feed -. ranking timeout .-> Popular[(Regional Popularity Store)]
     Popular --> Rules
     Client -->|article media| CDN[CDN]
-    CDN --> Media[(Media Object Storage)]
+    CDN --> Media[(Media Object Store)]
 ```
 
 #### Quick reference — client-to-service edge path
@@ -208,7 +221,7 @@ These boxes establish the network boundary and availability path. Mention them b
 - **User features** are keyed by `user_id` and describe preferences or recent behavior: topic affinity, publisher affinity, language, country, recent clicks, and negative feedback. They change as readers interact, contain privacy-sensitive data, and need user-specific retention and deletion policies.
 - **Content features** are keyed by `article_id` and describe reusable article properties: topic, language, publisher, age, quality, popularity, embedding, and estimated reading time. They are produced mainly by ingestion or content-processing pipelines and can be shared across many readers.
 - Keep them as separate logical tables, namespaces, ownership boundaries, and update pipelines. They may still use the same physical feature-store platform when its scaling, isolation, availability, and governance are sufficient; separate logical domains do not automatically require separate database products.
-- The online ranker retrieves one user's features and batch-loads content features for the bounded candidate set, then joins them with request context before inference.
+- The Ranking Service retrieves one user's features and batch-loads content features for the bounded candidate set, then joins them with request context before inference.
 
 For an existing cursor, read from the stable feed-session cache and apply current hard suppressions.
 
@@ -217,7 +230,7 @@ For a new session:
 1. Retrieve candidate pools, user state, and user features in parallel.
 2. Merge candidate sources and deduplicate article IDs.
 3. Apply hard pre-ranking eligibility filters: safety, active status, region, language, expiry, and user blocks.
-4. Batch-load content features and score the bounded candidate set with the online ranker.
+4. Batch-load content features and score the bounded candidate set with the Ranking Service.
 5. Apply post-ranking slate rules: topic/publisher diversity, canonical-story deduplication, and verified editorial constraints.
 6. Cache approximately 200 ordered article IDs as an immutable feed session.
 7. Hydrate metadata for only the first 20 articles.
@@ -239,15 +252,15 @@ Example candidate mixture:
 
 ```mermaid
 flowchart LR
-    Client --> Collector[Event Collector]
+    Client --> Collector[Event Collection Service]
     Collector --> Stream[[Event Stream]]
-    Stream --> OnlineWorker[Online Feature Worker]
-    OnlineWorker --> Features[(Online User Features)]
-    Stream --> Lake[(Data Lake)]
-    Lake --> Training[Offline Training]
+    Stream --> OnlineWorker[User Feature Update Worker]
+    OnlineWorker --> Features[(User Feature Store)]
+    Stream --> Lake[(Event Data Lake)]
+    Lake --> Training[Model Training Pipeline]
     Training --> Registry[Model Registry]
-    Registry --> Ranker[Online Ranker]
-    Client -->|hide or block| PreferenceAPI[Preference API]
+    Registry --> Ranker[Ranking Service]
+    Client -->|hide or block| PreferenceAPI[Preference Service]
     PreferenceAPI --> Preferences[(Preference Store)]
 ```
 
@@ -419,10 +432,10 @@ Do not say “NoSQL because it scales.” State the access pattern, partition ke
 Existing cursor
   → current immutable session
 
-New session with healthy ranker
+New session with healthy Ranking Service
   → personalized candidate generation and ranking
 
-Ranker timeout or feature-service failure
+Ranking Service timeout or Feature Store read failure
   → recent complete personalized snapshot, if sufficiently fresh
   → otherwise precomputed regional/segment popular pool
 
@@ -453,7 +466,7 @@ Do not end immediately after the deep dive. Give a concise recap and show that y
 ### Finish with operational considerations
 
 - Bottlenecks: batch inference capacity, hot candidate pools, cache stampedes, and metadata batch reads.
-- Failures: ranker timeout, feature-store timeout, session-cache loss, queue backlog, and regional outage.
+- Failures: Ranking Service timeout, Feature Store timeout, Feed Session Cache loss, Event Stream backlog, and regional outage.
 - Observability: feed latency, fallback rate, empty-feed rate, cache-hit rate, ingestion lag, feature freshness, stream lag, model errors, and recommendation-quality metrics.
 - Security and privacy: publisher authorization, event minimization, retention, deletion, encryption, and access controls.
 - Model evolution: offline evaluation, canary/A/B rollout, model/feature versioning, drift monitoring, and rollback.
