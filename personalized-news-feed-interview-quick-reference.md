@@ -132,7 +132,17 @@ Ask: **“Does this scope and requirement summary look right before I propose th
 
 The high-level design is a logical backend architecture, not a cloud-deployment diagram. Show clients, services, storage roles, synchronous calls, asynchronous boundaries, and the three core flows.
 
-### One valid high-level architecture
+### Prefer one focused diagram per core flow
+
+Do not force all components into one giant diagram. Draw one small diagram for each functional workflow, then connect the diagrams through named shared data or services:
+
+- **Flow A produces** active content metadata, content features, and candidate pools consumed by Flow B.
+- **Flow B produces** impressions and engagement events consumed by Flow C.
+- **Flow C updates** user features, preferences, and model versions consumed by Flow B.
+
+This keeps each end-to-end path explainable while still showing how the whole system forms a feedback loop. The diagrams below show one credible design, not the only valid answer.
+
+### Flow A — Article ingestion
 
 ```mermaid
 flowchart LR
@@ -141,41 +151,13 @@ flowchart LR
     Processing --> Metadata[(Content Metadata)]
     Processing --> Blob[(Object Storage)]
     Processing --> Gate[Safety, Quality and Dedup Gate]
-    Gate -->|ACTIVE article event| PoolBuilder[Candidate Pool Builder]
-    PoolBuilder --> Pools[(Candidate Pools)]
-
-    Client --> Feed[Feed Service]
-    Feed <--> Session[(Feed Session Cache)]
-    Feed --> Candidates[Candidate Generator]
-    Candidates --> Pools
-    Candidates --> Features[(Online Feature Store)]
-    Candidates --> Ranker[Online Ranker]
-    Ranker --> Features
-    Ranker --> Rules[Eligibility and Slate Rules]
-    Rules --> Session
-    Rules --> Metadata
-    Metadata -->|hydrate current page| Feed
-    Feed --> Client
-
-    Feed -. ranker timeout .-> Popular[(Regional Popular Feed)]
-    Popular --> Rules
-
-    Client --> Collector[Event Collector]
-    Collector --> Stream[[Event Stream]]
-    Stream --> OnlineWorker[Online Feature Worker]
-    OnlineWorker --> Features
-    Stream --> Lake[(Data Lake)]
-    Lake --> Training[Offline Training]
-    Training --> Registry[Model Registry]
-    Registry --> Ranker
-
-    Client -->|hide or block| Preferences[(Preference Store)]
-    Preferences --> Rules
+    Gate -->|ACTIVE article event| Builder[Candidate and Feature Builder]
+    Builder --> Pools[(Candidate Pools)]
+    Builder --> Features[(Content Features)]
+    Gate -->|remove or takedown| Invalidation[Invalidation Event]
+    Invalidation --> Metadata
+    Invalidation --> Pools
 ```
-
-This is one credible design, not the only valid answer. A simpler system could begin with popularity and rules, then add ML components as scale and product requirements grow.
-
-### Flow A — Article ingestion
 
 1. Authenticate the publisher and validate an idempotent publishing request.
 2. Store article metadata in a `PENDING` or `PROCESSING` state.
@@ -186,6 +168,25 @@ This is one credible design, not the only valid answer. A simpler system could b
 7. Publish update, expiry, removal, and takedown events so indexes, pools, and caches can react.
 
 ### Flow B — Online feed serving
+
+```mermaid
+flowchart LR
+    Client --> Feed[Feed Service]
+    Feed <--> Session[(Feed Session Cache)]
+    Feed -->|new session| Generator[Candidate Generator]
+    Pools[(Candidate Pools)] --> Generator
+    Features[(User and Content Features)] --> Generator
+    Generator --> Ranker[Online Ranker]
+    Features --> Ranker
+    Ranker --> Rules[Eligibility and Slate Rules]
+    Preferences[(Preference Store)] --> Rules
+    Rules --> Session
+    Rules --> Metadata[(Content Metadata)]
+    Metadata -->|hydrate current page| Feed
+    Feed --> Client
+    Feed -. ranker timeout .-> Popular[(Regional Popular Feed)]
+    Popular --> Rules
+```
 
 For an existing cursor, read from the stable feed-session cache and apply current hard suppressions.
 
@@ -213,6 +214,20 @@ Example candidate mixture:
 ```
 
 ### Flow C — Feedback and learning
+
+```mermaid
+flowchart LR
+    Client --> Collector[Event Collector]
+    Collector --> Stream[[Event Stream]]
+    Stream --> OnlineWorker[Online Feature Worker]
+    OnlineWorker --> Features[(Online User Features)]
+    Stream --> Lake[(Data Lake)]
+    Lake --> Training[Offline Training]
+    Training --> Registry[Model Registry]
+    Registry --> Ranker[Online Ranker]
+    Client -->|hide or block| PreferenceAPI[Preference API]
+    PreferenceAPI --> Preferences[(Preference Store)]
+```
 
 1. Batch impression events; send clicks, meaningful reads, saves, hides, and blocks.
 2. Publish events to a partitioned stream using an `event_id` for idempotency.
