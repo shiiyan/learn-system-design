@@ -155,6 +155,14 @@ Do not force all components into one giant diagram. Draw one small diagram for e
 
 This keeps each end-to-end path explainable while still showing how the whole system forms a feedback loop. The diagrams below show one credible design, not the only valid answer.
 
+The core personalization contract connecting the flows is:
+
+```text
+ranking_score = f(user_features, content_features, request_context)
+```
+
+Flow A produces content features, Flow C produces user features and model versions, and Flow B supplies request context, retrieves bounded candidates, calls the Ranking Service, applies hard policy and slate rules, and preserves the resulting order in a feed session.
+
 ### Flow A — Article ingestion
 
 ```mermaid
@@ -359,22 +367,96 @@ This preserves stable order and avoids duplicates while enforcing a newly writte
 
 > “I use a server-side immutable session because an offset into a newly ranked list is unstable. The signed cursor identifies the session and next scan position. I apply current hard suppressions on every page and advance over skipped IDs, which preserves no-duplicate pagination without returning newly forbidden content.”
 
-### Deep dive 2 — Hybrid personalization and low-latency serving
+### Deep dive 2 — Ranking score, feature stores, and low-latency serving
 
-For a cache miss or new feed session:
+The core personalization idea is:
+
+```text
+ranking_score = f(user_features, content_features, request_context)
+```
+
+For each candidate article, the Ranking Service combines information about the reader, the article, and the current request. It returns one or more predictions that are converted into a ranking score. This equation explains why the architecture needs separate user and content feature pipelines, a request-time context assembler, bounded candidate generation, online inference, and a feedback loop.
+
+#### What each input means
+
+| Input | Examples | Owner and location | Typical freshness |
+|---|---|---|---|
+| User features | Topic and publisher affinity, language, recent reading behavior, long-term embedding | User Feature Update Worker → User Feature Store, keyed by `user_id` | Seconds to minutes for recent behavior; slower for long-term features |
+| Content features | Topic, publisher, language, content embedding, quality, publication time, popularity | Candidate and Feature Update Worker → Content Feature Store, keyed by `article_id` | Created at activation; popularity and trend values update nearline |
+| Request context | Current time, region, device, session behavior, candidate source | Constructed in memory by the Feed Service or Ranking Service | Per request |
+
+Explicit hides and blocks belong in the Preference Store and are enforced as hard filters. Safety, takedown, expiry, and regional eligibility come from authoritative content state. They must not become weak model features that a high relevance score can override.
+
+#### How the equation creates the architecture
+
+```mermaid
+flowchart LR
+    Events[[Engagement Events]] --> UserWorker[User Feature Update Worker]
+    UserWorker --> UserStore[(User Feature Store)]
+    Articles[[Active Article Events]] --> ContentWorker[Candidate and Feature Update Worker]
+    ContentWorker --> ContentStore[(Content Feature Store)]
+    Request[Feed Request] --> Context[Request Context]
+    Candidates[Bounded Candidate IDs] --> Ranking[Ranking Service]
+    UserStore --> Ranking
+    ContentStore --> Ranking
+    Context --> Ranking
+    Ranking --> Scores[Scored Candidates]
+    Scores --> Policy[Feed Policy Module]
+    Policy --> Session[(Feed Session Cache)]
+```
+
+This separation matters because the data has different keys, producers, update rates, reuse patterns, and privacy rules. The Ranking Service reads one user-feature record, batch-reads content features for the bounded candidates, and creates a row such as `(user, article, context)` for each candidate. Context is usually computed for the request rather than stored as another long-lived database.
+
+Minimal logical records:
+
+```text
+User Feature Store
+  PK: user_id
+  values: topic_affinities, publisher_affinities, recent_embedding,
+          language, feature_version, updated_at
+
+Content Feature Store
+  PK: article_id
+  values: topic, publisher_id, language, content_embedding, quality,
+          published_at, popularity_features, feature_version, updated_at
+```
+
+The stores may use the same physical online feature platform, but keep separate logical tables, ownership, access control, retention, and update pipelines.
+
+#### From model predictions to the final order
+
+One model may directly output a scalar score. A multi-objective design can instead produce several predictions:
+
+```text
+predictions = MLModel(user_features, content_features, request_context)
+
+ranking_score =
+    alpha * P(click)
+  + beta  * P(meaningful_read)
+  + gamma * P(save)
+  - delta * P(hide)
+  + freshness_boost
+```
+
+The exact model family and weights are normally out of scope. What matters is defining the product objective and logging the model and feature versions used to produce each impression. After sorting by score, the Feed Policy Module applies slate-level rules such as topic diversity, publisher diversity, canonical-story deduplication, and verified emergency-news insertion. These rules operate on the whole result list and therefore are not fully represented by an independent per-article score.
+
+#### Online scoring path
 
 ```text
 load shared candidate pools, user features, and preferences in parallel
   → merge and deduplicate roughly 500 candidate IDs
   → apply hard eligibility filters
   → batch-load content features
-  → batch-score candidates in the Ranking Service
+  → build approximately 500 (user, article, context) feature rows
+  → batch-score them in one Ranking Service request
   → apply diversity and canonical-story deduplication
-  → save the top 200 IDs as one session
+  → save the top 200 IDs as one immutable session
   → hydrate only the first 20 items
 ```
 
-The system does not score every article for every request. Offline and nearline workers prepare reusable pools by region, language, topic, publisher, recency, and popularity. Online work is bounded to a few hundred candidates and adds per-user and request-context signals.
+The system does not score every article for every request. Offline and nearline workers prepare reusable pools by region, language, topic, publisher, recency, and popularity. Online work is bounded to a few hundred candidates and runs only when creating or refreshing a session, not for every pagination request.
+
+At 23K peak feed QPS, scoring 500 articles for every request would mean 11.5M candidate scores per second. If, for example, only 25% of requests create a new session, the peak falls to roughly 2.9M candidate scores per second. This estimate motivates bounded candidate sets, batch inference, session reuse, autoscaling, and load shedding.
 
 #### Example p95 latency budget
 
@@ -392,9 +474,18 @@ The system does not score every article for every request. Offline and nearline 
 
 Use request deadlines shorter than the overall API deadline. Batch feature and metadata reads, parallelize independent work, avoid per-candidate RPCs, and hydrate only the returned page.
 
+#### Freshness, correctness, and failure behavior
+
+- The User Feature Update Worker consumes recent events and updates soft interests asynchronously; delayed events reduce relevance but should not break serving.
+- The Candidate and Feature Update Worker writes content features before or together with making an article eligible for candidate pools.
+- Log `model_version`, `feature_version`, candidate source, impression position, and outcome so training can reproduce and evaluate serving decisions.
+- Reuse feature definitions between training and serving, or version transformations explicitly, to control training-serving skew.
+- If user features are missing, use new-user, regional, or segment defaults. If a candidate lacks required content features, skip it or use a documented safe default.
+- If a feature batch or model request times out, use a recent complete personalized snapshot or the popularity fallback; do not return a half-ranked mixture with unpredictable ordering.
+
 **Prepared answer:**
 
-> “The main latency decision is a hybrid design: shared pools provide recall cheaply, while online ranking personalizes only a bounded candidate set. Parallel reads and batch inference keep the critical path predictable. The cost is slightly lower recall than scoring the whole corpus, but it meets the p95 target at much lower compute cost.”
+> “The center of the design is `score = f(user features, content features, context)`. User features are updated from behavior and keyed by user ID; content features are produced during ingestion and keyed by article ID; request context is assembled online. For a new session, I read one user vector and batch-read features for about 500 candidate IDs, then score them in one inference call. Hard safety and suppression filters stay outside the model, and slate rules run after scoring. Bounded candidates and session reuse trade some recall and freshness for predictable latency, availability, and inference cost.”
 
 ### Deep dive 3 — Scaling to millions of readers
 
@@ -599,4 +690,10 @@ Step 1: Agree on the problem.
 Step 2: Agree on the blueprint.
 Step 3: Prove the riskiest part.
 Step 4: Show that you understand the whole system and its limitations.
+
+Personalization core:
+  article ingestion → content features
+  user behavior     → user features
+  current request   → context
+  all three         → Ranking Service → Feed Policy Module → feed session
 ```
