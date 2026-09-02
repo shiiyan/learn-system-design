@@ -303,6 +303,52 @@ For a 20-minute Step 3, manage time approximately like this:
 
 For example, the interviewer might select feed-session pagination and then ask how it behaves when the Preference Store or Feed Session Cache fails. Another interview might focus almost entirely on scaling the Ranking Service, while another may choose event idempotency and feature freshness. Do not switch topics merely because another prepared section exists.
 
+### Deep-dive orientation — how the design meets its non-functional requirements
+
+Use this as a map before selecting one primary deep dive. No single service provides scale, latency, and availability by itself:
+
+```text
+Scale        = bound work + partition state + add workers + buffer async work
+Low latency  = precompute + cache + batch + parallelize + enforce deadlines
+Availability = replicate + route around failures + isolate + degrade safely
+```
+
+Assume 10M DAU, approximately 23K peak feed QPS, 20 articles per page, approximately 4B logical impressions per day, p95 feed latency below 300 ms, and 99.99% feed-serving availability.
+
+| Design point | Concrete AWS example | Contribution to millions of users | Contribution to low latency | Contribution to high availability |
+|---|---|---|---|---|
+| Global request routing | AWS Global Accelerator → regional ALB | Splits traffic between regional stacks | Directs readers to a nearby endpoint | Health checks route away from unhealthy endpoints |
+| Feed Service compute | Stateless service on ECS/Fargate behind ALB | Adds tasks horizontally as QPS grows | Keeps warm headroom and scales before saturation | Runs replaceable tasks across multiple AZs |
+| Hybrid feed generation | Background workers + DynamoDB candidate pools + ElastiCache | Avoids materializing a new feed for all 10M users per article | Precomputes reusable pools so requests inspect hundreds, not every article | Existing pools remain usable when ingestion or personalization is impaired |
+| Feed sessions | ElastiCache for Valkey/Redis OSS | Cluster mode shards sessions by `user_id + session_id` | Reuses approximately 200 ordered IDs instead of re-ranking each page | Multi-AZ replicas and automatic failover; sessions remain rebuildable |
+| Content metadata | DynamoDB, `PK = article_id` | Partitions different article IDs; batch-loads one page | Single-digit-millisecond point reads and one batch instead of 20 sequential calls | Automatically replicates data across three AZs |
+| User preferences | DynamoDB, `PK = user_id`, `SK = suppression_type#target_id` | Distributes independent users across partitions | Direct query; strong read after a recent hide when required | Persists a hide before acknowledgment; learning failures cannot erase it |
+| User and content features | Separate logical DynamoDB tables keyed by `user_id` and `article_id` | Distributes user-owned and article-owned state independently | Loads one user record and batch-loads bounded content features in parallel | Uses durable multi-AZ state; missing soft features fall back safely |
+| Candidate pools and hot shared data | Versioned DynamoDB pools + regional ElastiCache | Partitions pools by region, language, segment, and version | Serves frequently reused pools from memory | Durable base survives cache loss; replicas reduce cache-node failure impact |
+| Ranking | SageMaker AI real-time endpoint | Adds inference instances and batch-scores candidates | Sends approximately 500 candidates in one request with a strict deadline | Uses multiple instances across AZs and falls back on timeout |
+| Feedback ingestion | Kinesis Data Streams | Partitions and buffers billions of logical events; batches impressions | Moves feature updates and analytics off the feed-serving path | Replicates stream data across three AZs |
+| Feedback workers | Lambda or ECS consumers | Adds consumers as stream lag grows | Lets serving continue without waiting for passive learning | Retries and checkpoints; backlog delays learning rather than feed serving |
+| Media path | S3 + CloudFront | Separates large-object traffic from the Feed Service | Serves images and video from edge locations | Stores S3 Standard objects across at least three AZs |
+| Regional failover | Duplicate regional stacks + Global Accelerator + selected DynamoDB global tables | Gives each geography independent capacity | Reads local regional stores instead of crossing Regions | Routes to another Region when justified by the recovery objective |
+| Dependency controls | Deadlines, bounded retries, circuit breakers, and load shedding | Rejects or simplifies excess work before saturation cascades | Stops slow dependencies before the 300 ms deadline | Returns a complete fallback instead of propagating a dependency failure |
+| Operations | CloudWatch metrics, alarms, and autoscaling policies | Scales on QPS, utilization, inference load, and stream lag | Measures p95/p99 rather than relying only on averages | Alerts on fallbacks, empty feeds, throttling, cache misses, and unhealthy capacity |
+
+Current AWS behavior referenced above: [Global Accelerator endpoint groups](https://docs.aws.amazon.com/global-accelerator/latest/dg/about-endpoint-groups.html), [ECS capacity and availability](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/capacity-availability-best-practice.html), [DynamoDB on-demand scaling](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html), [ElastiCache sharding and replication](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/CacheNodes.NodeGroups.html), [ElastiCache Multi-AZ failover](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/AutoFailover.html), [SageMaker AI deployment best practices](https://docs.aws.amazon.com/sagemaker/latest/dg/deployment-best-practices.html), [Kinesis Data Streams limits](https://docs.aws.amazon.com/streams/latest/dev/service-sizes-and-limits.html), [AWS multi-AZ guidance for Kinesis and other managed stores](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_fault_isolation_multiaz_region_system.html), [CloudFront caching](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/ConfiguringCaching.html), [S3 data protection](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html), and [DynamoDB global-table design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-global-table-design.html).
+
+#### Three interview-ready summaries
+
+##### Millions of users
+
+> “I handle scale by bounding online work, partitioning independent state, horizontally scaling stateless services, and buffering high-volume feedback. I rank only hundreds of candidates, store only 200 session IDs, hydrate only 20 records, and partition user-owned and article-owned data by their natural IDs.”
+
+##### Low latency
+
+> “I meet the 300-millisecond target through precomputed candidate pools, in-memory session and pool caches, parallel and batched reads, one batched ranking request, and page-only metadata hydration. Every dependency has a strict deadline, so a slow personalization component cannot consume the entire latency budget.”
+
+##### High availability
+
+> “I run stateless services and ranking instances across Availability Zones, use multi-AZ managed stores, route only to healthy endpoints, and isolate serving from learning pipelines. If personalization fails, I fall back through complete known-good feeds while continuing to enforce safety and explicit suppressions.”
+
 ### Deep dive 1 — Feed API, session schema, and pagination correctness
 
 This is the best primary deep dive because it connects the user-visible API to cache design, consistency, and correctness.
@@ -792,3 +838,57 @@ Personalization core:
   current request   → context
   all three         → Ranking Service → Feed Policy Module → feed session
 ```
+
+---
+
+## Appendix — Scaling toolbox from zero to millions of users
+
+This toolbox paraphrases the progression in Chapter 1 of Alex Xu's *System Design Interview: An Insider's Guide*. It is a menu of responses to observed bottlenecks, not a checklist to deploy on day one. Start with the simplest architecture that meets current requirements, measure it, and add the next mechanism when a specific resource, latency, or failure limit appears.
+
+### Core comparisons
+
+| Decision | Option A | Option B | Practical selection rule |
+|---|---|---|---|
+| SQL vs. NoSQL | SQL favors relationships, joins, constraints, transactions, and flexible queries | NoSQL families favor specialized access patterns such as key-value lookup, documents, wide columns, or graphs | Choose from required reads, writes, invariants, and partition path—not from the word `scale` |
+| Vertical vs. horizontal scaling | Scale up by adding CPU, RAM, disk, or a larger instance; simple but bounded and often a larger failure domain | Scale out by adding servers or partitions; greater capacity and redundancy but distributed-system complexity | Scale up while it is economical and safe; design stateless or partitionable boundaries before the hard limit |
+| Stateful vs. stateless compute | A stateful server requires the same user to return to the server that owns the session | A stateless server keeps authoritative state in a shared store, so any healthy instance can serve the request | Prefer stateless request handlers when horizontal scaling and failover matter; keep state in an appropriate shared store |
+| Replication vs. sharding | Replication copies the same data for availability, durability, or read capacity | Sharding divides different data for storage and write/read throughput | Use replication for failure survival and sharding for capacity; most large systems eventually need both |
+| Synchronous vs. asynchronous work | Synchronous work finishes before the user receives success and is suitable for immediate correctness promises | Asynchronous work uses a queue or log to buffer work and let producers and consumers scale independently | Keep only user-visible correctness on the critical path; move slow, bursty, or replayable work behind a durable boundary |
+
+### Techniques and tools
+
+| Tool or pattern | Problem it addresses | Core mechanism | Main tradeoffs and failure questions | Mapping to this news feed |
+|---|---|---|---|---|
+| Single-server baseline | Avoids premature distributed complexity at very small scale | Web process, application logic, and data initially share one deployment | One capacity ceiling and one failure domain; useful only while the risk is acceptable | Not the target architecture, but a reminder to justify every later component |
+| Separate web and data tiers | Application and storage resources grow differently | Move request handling and persistence into independently scalable tiers | Adds a network boundary and deployment surface | Feed Service scales independently from DynamoDB, caches, and ranking |
+| Load balancer | One server becomes overloaded or unavailable | Health-check and distribute requests across multiple service replicas | The load balancer and health policy must themselves be highly available; retries can amplify load | ALB distributes feed requests across stateless ECS tasks |
+| Database replication | One database node is a durability or availability risk; reads may dominate writes | Copy committed data to replicas and promote or reroute during failure | Replica lag, stale reads, promotion safety, split brain, and recovery time | DynamoDB manages multi-AZ replication; cross-Region replication is a separate decision |
+| Cache tier | Repeated reads or expensive computations overload the database and increase latency | Keep copied hot answers in memory with a key, TTL, and eviction policy | Staleness, invalidation, stampedes, hot keys, memory pressure, cache loss, and cold-start recovery | Cache immutable feed sessions, hot candidate pools, and selected metadata—not authoritative hides alone |
+| Content delivery network | Large static objects are slow and expensive to serve from the application origin | Cache versioned objects at geographically distributed edge locations | TTL choice, invalidation, origin fallback, privacy, and transfer cost | CloudFront serves article images and video from S3; personalized feed JSON normally stays unshared |
+| Stateless request tier | Sticky sessions make adding, removing, and replacing servers difficult | Move authoritative session/state out of process so any instance can handle the next request | Shared state becomes a dependency; local caches must remain disposable | Feed Service instances keep no authoritative user or feed state locally |
+| Autoscaling | Demand changes over time and fixed capacity either overloads or wastes resources | Add or remove compute using utilization, throughput, latency, or backlog signals | Scaling is not instantaneous; retain warm capacity, correct limits, and cooldowns | Scale Feed Service by request pressure, ranking by inference load, and consumers by stream lag |
+| Multiple regions or data centers | Distant users see high latency, or a regional outage exceeds the recovery objective | Deploy regional stacks, route users geographically, and replicate required data | Cross-Region consistency, data conflicts, failover capacity, deployment parity, cost, and operational complexity | Keep Japan and US serving local; route failover only when replicated policy/content state is safe enough |
+| Message queue or durable stream | Slow or bursty consumers should not block producers | Persist work between producers and consumers so each side scales and fails independently | Delivery semantics, idempotency, ordering, retries, poison messages, retention, and backpressure | Kinesis buffers engagement; explicit hides first use the synchronous Preference Store |
+| Centralized logging | Failures spread across many hosts and cannot be debugged locally | Aggregate structured logs with request, session, user-safe, model, and event identifiers | Sensitive-data handling, storage cost, sampling, and correlation quality | Trace feed requests through candidates, ranking, fallback, and metadata hydration |
+| Metrics and alerting | Operators need to know whether the system meets its SLOs and where saturation starts | Collect host, service, dependency, and business measurements; alert on actionable thresholds | Averages hide tails; excessive alerts create noise; metrics need owners and runbooks | Track p95/p99 latency, cache hit rate, fallback rate, throttling, inference utilization, and stream lag |
+| Build, test, and deployment automation | Many services and regions drift or fail through manual changes | Automate validation, rollout, rollback, and environment consistency | Bad automation can spread failures quickly; use staged or canary rollout and tested rollback | Version ranking models/features, canary deployments, and keep regional stacks equivalent |
+| Database sharding | One database's storage or throughput ceiling is reached | Select a high-cardinality partition key that routes records across shards | Resharding, uneven distribution, hot partitions, cross-shard joins, transactions, and operational complexity | Partition user-owned state by `user_id`, content by `article_id`, and pools by region/language/segment |
+| Hot-key isolation | A celebrity, breaking article, or shared pool overloads one otherwise healthy shard | Cache, replicate reads, add key suffixes/write sharding where ordering permits, or isolate the hot entity | More copies complicate invalidation; write sharding complicates reads and ordering | Protect breaking-news metadata and regional popularity pools from concentrated read traffic |
+| Denormalized serving view | Joins across shards or services are too slow for the critical path | Precompute a record shaped for the exact online access pattern | Duplicate data, synchronization lag, repair jobs, and more storage | Publish article-ID-keyed metadata and feature views from richer editorial/processing sources |
+| Split independent services | One deployment cannot scale, fail, or evolve different workloads independently | Separate components at clear ownership and data-flow boundaries | More RPCs, deployments, observability, and operational overhead; do not split without a concrete benefit | Isolate ingestion, feed serving, preferences, ranking, and feedback processing where their scaling/failure profiles differ |
+
+### Chapter-to-interview application rule
+
+Do not answer a scale question by listing this toolbox. Use the causal chain:
+
+```text
+requirement
+  → measured or estimated bottleneck
+  → smallest mechanism that removes it
+  → failure mode introduced by that mechanism
+  → mitigation and tradeoff
+```
+
+Example:
+
+> “At 23K peak feed QPS, hydrating 20 articles means up to 460K logical metadata reads per second before caching. Because the access pattern is batch lookup by known article IDs, I use an article-ID-partitioned serving store and batch reads. I cache hot metadata to protect popular keys, but I keep DynamoDB as the durable source so the system can recover from a cold cache.”
