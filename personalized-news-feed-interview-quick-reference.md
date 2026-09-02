@@ -582,7 +582,47 @@ PUT /feed/preferences/suppressions/publisher-77
 Authorization: Bearer <token>
 ```
 
-The Preference Service durably writes the suppression before acknowledging it, invalidates or updates its cache, and publishes a feedback event for features, analytics, and model training. Feed page reads check the latest suppression state even when the session was created earlier.
+Do not send a hide only through the asynchronous feedback pipeline. A stream trades immediate completion for buffering, so consumer lag could let hidden content reappear. Split the operation into two paths:
+
+```text
+Correctness path:
+Client -> Preference Service -> durable Preference Store -> acknowledge
+
+Learning path:
+committed preference change -> Event Stream -> features, analytics, training
+```
+
+A DynamoDB preference table can group one user's independently addressable suppressions:
+
+```text
+PK: user_id
+SK: suppression_type#target_id
+
+user-42 | PUBLISHER#publisher-77
+user-42 | TOPIC#cryptocurrency
+user-42 | ARTICLE#article-900
+```
+
+The Preference Service writes a deterministic key before acknowledging the request. Retrying the same `PUT` is therefore idempotent. After DynamoDB returns HTTP 200, the write is durably persisted. Feed page reads query the latest suppression state even for an older immutable feed session, skip invalid IDs, and overfetch replacements. Use a strongly consistent base-table read after a recent hide when read-your-writes is required; do not use a global secondary index as the authoritative immediate-read path because DynamoDB GSIs are eventually consistent. See [AWS DynamoDB read consistency](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html) and [sort-key design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-sort-keys.html).
+
+For example:
+
+```text
+10:00:00  hide publisher-77 is durably stored and acknowledged
+10:00:01  page two reads current suppressions and skips publisher-77
+10:00:20  an asynchronous worker updates the user's ML features
+```
+
+The committed DynamoDB change can be captured with DynamoDB Streams for downstream learning. Streams operate asynchronously and preserve modification order for each item, so the serving path must not wait for the consumer. Downstream processing should still be idempotent because a Lambda consumer can retry a failed batch. See [AWS DynamoDB Streams](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html).
+
+Failure and tradeoff summary:
+
+- If the durable write fails, do not report that the hide succeeded.
+- If the write succeeds but the response is lost, retry the same deterministic key.
+- If the stream is backlogged, learning becomes stale but suppression remains correct.
+- If preferences are cached, update or invalidate the cache after the write; after a recent hide, bypass an untrusted cached value or perform a strong read.
+- Strong reads and synchronous writes cost more than eventual asynchronous processing, so reserve them for explicit user promises rather than passive clicks and impressions.
+- If the Preference Store is unavailable, use a trustworthy recent suppression snapshot. If no authoritative snapshot exists and suppressions are a hard invariant, fail closed or use a conservative safe fallback rather than silently serving possibly blocked content.
 
 Stream consumers update recent User Feature Store values within minutes. Historical events flow to the Event Data Lake, where the Model Training Pipeline constructs versioned datasets, evaluates a new model, registers it, and rolls it out through canary or A/B testing. Record `model_version`, position, and candidate context so offline evaluation can distinguish model behavior from presentation bias.
 
