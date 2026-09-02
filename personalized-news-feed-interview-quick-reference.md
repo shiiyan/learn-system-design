@@ -178,9 +178,10 @@ flowchart LR
     Feed <--> Session[(Feed Session Cache)]
     Feed -->|new session| Generator[Candidate Generator]
     Pools[(Candidate Pools)] --> Generator
-    Features[(User and Content Features)] --> Generator
+    UserFeatures[(User Feature Store)] --> Generator
     Generator --> Ranker[Online Ranker]
-    Features --> Ranker
+    UserFeatures --> Ranker
+    ContentFeatures[(Content Feature Store)] --> Ranker
     Ranker --> Rules[Eligibility and Slate Rules]
     Preferences[(Preference Store)] --> Rules
     Rules --> Session
@@ -202,14 +203,21 @@ flowchart LR
 
 These boxes establish the network boundary and availability path. Mention them briefly, then spend most interview time on candidate generation, ranking, session correctness, and fallback behavior unless edge or multi-region routing is the selected deep dive.
 
+#### Quick reference — user features versus content features
+
+- **User features** are keyed by `user_id` and describe preferences or recent behavior: topic affinity, publisher affinity, language, country, recent clicks, and negative feedback. They change as readers interact, contain privacy-sensitive data, and need user-specific retention and deletion policies.
+- **Content features** are keyed by `article_id` and describe reusable article properties: topic, language, publisher, age, quality, popularity, embedding, and estimated reading time. They are produced mainly by ingestion or content-processing pipelines and can be shared across many readers.
+- Keep them as separate logical tables, namespaces, ownership boundaries, and update pipelines. They may still use the same physical feature-store platform when its scaling, isolation, availability, and governance are sufficient; separate logical domains do not automatically require separate database products.
+- The online ranker retrieves one user's features and batch-loads content features for the bounded candidate set, then joins them with request context before inference.
+
 For an existing cursor, read from the stable feed-session cache and apply current hard suppressions.
 
 For a new session:
 
-1. Retrieve candidate pools and user state/features in parallel.
+1. Retrieve candidate pools, user state, and user features in parallel.
 2. Merge candidate sources and deduplicate article IDs.
 3. Apply hard pre-ranking eligibility filters: safety, active status, region, language, expiry, and user blocks.
-4. Batch-score a bounded candidate set with the online ranker.
+4. Batch-load content features and score the bounded candidate set with the online ranker.
 5. Apply post-ranking slate rules: topic/publisher diversity, canonical-story deduplication, and verified editorial constraints.
 6. Cache approximately 200 ordered article IDs as an immutable feed session.
 7. Hydrate metadata for only the first 20 articles.
@@ -396,6 +404,8 @@ This preserves stable ordering without returning newly forbidden items or introd
 |---|---|---|
 | Active session | Short-lived ordered IDs, list slicing, TTL | Redis-like cache |
 | Content metadata | Batch lookup by article ID | Managed key-value/document store |
+| User features | Lookup by user ID; frequent behavior-driven updates; privacy lifecycle | Online feature table or low-latency key-value store |
+| Content features | Batch lookup by article IDs; ingestion-driven updates; shared across users | Separate online feature table or low-latency key-value store |
 | User preferences | Lookup/update by user ID; read-your-writes for hides | Durable key-value/document store plus cache |
 | Candidate pool | Lookup by region, language, segment, and version | Key-value store or cache |
 | Media | Large immutable objects | Object storage plus CDN |
