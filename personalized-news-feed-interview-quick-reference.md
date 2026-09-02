@@ -284,15 +284,16 @@ Walk through one write path and one read path, explain why each specialized comp
 
 Do not spend this step reciting every endpoint, table, or technology. Agree with the interviewer on one primary deep dive, explore it through the normal flow, bottleneck, invariant, failure, mitigation, and tradeoff, and use the other topics as prepared follow-ups.
 
-For a 20-minute Step 3, a strong default is:
+The six topics below are a **preparation menu**, not six required interview sections. In the real interview, expect to explore one topic deeply or, if the interviewer redirects, one primary topic plus a closely related second topic.
 
-1. **2 minutes:** confirm the deep-dive focus and restate the requirements it must protect.
-2. **8 minutes:** API, feed-session schema, pagination invariant, and hide/block correctness.
-3. **6 minutes:** candidate generation, batch ranking, and the latency budget.
-4. **3 minutes:** dependency failure and fallback behavior.
-5. **1 minute:** summarize the primary tradeoff and invite the next question.
+For a 20-minute Step 3, manage time approximately like this:
 
-If the interviewer selects scale, feedback learning, multi-region availability, or database technology instead, use the corresponding prepared deep dive below. You will rarely present all six in one interview.
+1. **About 2 minutes:** agree with the interviewer on the primary topic and restate the requirements or invariants it must protect.
+2. **About 14 minutes:** stay on that topic through its normal flow, bottleneck, data or API details, correctness invariant, failure mode, mitigation, and tradeoff.
+3. **About 3 minutes:** answer an interviewer-selected follow-up or connect one closely related second topic.
+4. **About 1 minute:** summarize the key decision and its cost.
+
+For example, the interviewer might select feed-session pagination and then ask how it behaves when the Preference Store or Feed Session Cache fails. Another interview might focus almost entirely on scaling the Ranking Service, while another may choose event idempotency and feature freshness. Do not switch topics merely because another prepared section exists.
 
 ### Deep dive 1 — Feed API, session schema, and pagination correctness
 
