@@ -171,7 +171,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    Client --> Feed[Feed Service]
+    Client --> DNS[DNS and Global Traffic Routing]
+    DNS --> Edge[API Gateway or Edge Proxy]
+    Edge --> LB[Load Balancer]
+    LB --> Feed[Feed Service]
     Feed <--> Session[(Feed Session Cache)]
     Feed -->|new session| Generator[Candidate Generator]
     Pools[(Candidate Pools)] --> Generator
@@ -183,10 +186,21 @@ flowchart LR
     Rules --> Session
     Rules --> Metadata[(Content Metadata)]
     Metadata -->|hydrate current page| Feed
-    Feed --> Client
+    Feed -->|response through edge path| Client
     Feed -. ranker timeout .-> Popular[(Regional Popular Feed)]
     Popular --> Rules
+    Client -->|article media| CDN[CDN]
+    CDN --> Media[(Media Object Storage)]
 ```
+
+#### Quick reference — client-to-service edge path
+
+- **DNS/global traffic routing** resolves the API hostname to a healthy regional endpoint. It helps route readers to a nearby region but is not a service that processes every feed record.
+- **API gateway or edge proxy** terminates TLS and commonly handles authentication checks, rate limiting, request validation, WAF/DDoS controls, and request routing.
+- **Load balancer** performs health checks and distributes requests across stateless Feed Service replicas within the selected region or availability zones.
+- **CDN** is primarily a separate media path for article images, video, and other public immutable assets backed by object storage. Avoid shared caching of personalized feed responses unless privacy, cache keys, invalidation, and acceptable staleness are explicitly designed.
+
+These boxes establish the network boundary and availability path. Mention them briefly, then spend most interview time on candidate generation, ranking, session correctness, and fallback behavior unless edge or multi-region routing is the selected deep dive.
 
 For an existing cursor, read from the stable feed-session cache and apply current hard suppressions.
 
