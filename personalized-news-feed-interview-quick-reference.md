@@ -94,25 +94,37 @@ Clarify measurable targets rather than saying “fast” or “highly available.
 - A ranker failure must not make the feed unavailable.
 - Explicit negative feedback must override cached recommendation quality.
 
-### End Step 1 with a scope contract
+### End Step 1 with an agreed requirements summary
 
-Summarize aloud and keep a compact memo visible:
+Summarize aloud and keep a compact memo visible. Organize it so the functional requirements map directly to the high-level workflows in Step 2.
 
-```text
-In scope: publisher news cards, personalized feed, cursor pagination,
-          feedback collection, candidate generation, online ranking
+#### Functional requirements
 
-Out of scope: publisher crawling, media encoding, ad ranking,
-              ML algorithm mathematics
+- **Workflow A — Article publishing and ingestion:** Publishers or editors can publish articles; only active, safe, policy-compliant content becomes eligible for distribution.
+- **Workflow B — Online feed serving:** Readers receive a personalized, cursor-paginated feed and can open the returned articles.
+- **Workflow C — Feedback and learning:** Readers can click, read, save, like, hide, or block; these signals improve future recommendations.
+- **Cross-flow correctness:** Removed, expired, unsafe, blocked, or duplicate content must not appear in the returned feed.
 
-Scale: 10M DAU, ~2.3K average / ~23K peak feed QPS,
-       ~4B logical impressions/day
+#### Non-functional and quality requirements
 
-Priorities: p95 < 300 ms, 99.99% serving availability,
-            content freshness, safe-content invariant
-```
+- **Relevance:** Articles should reflect the reader's interests while preserving useful topic and publisher diversity.
+- **Latency:** Feed responses should complete below 300 ms at p95.
+- **Availability:** Feed serving should reach 99.99% availability and return a degraded non-ML feed when personalization fails.
+- **Content freshness:** Newly approved articles should become eligible within two minutes.
+- **Feedback freshness:** Explicit hides or blocks should take effect within 30 seconds; passive behavior may update features within several minutes.
+- **Scalability:** Assume 10M DAU, approximately 2.3K average and 23K peak feed QPS, and roughly 4B logical impressions per day.
+- **Pagination correctness:** One feed session should have a stable order and should not return duplicate articles.
 
-Ask: **“Does this scope look right before I propose the architecture?”**
+#### Out of scope
+
+- Publisher crawling and partner integration details.
+- Media encoding and large-file delivery internals.
+- Advertisement selection and ranking.
+- ML model mathematics and training-algorithm derivation.
+
+The labels intentionally map to **Flow A**, **Flow B**, and **Flow C** in Step 2. If a functional requirement has no corresponding flow, the architecture is probably incomplete. If a major flow maps to no requirement, justify it or remove it as possible scope creep.
+
+Ask: **“Does this scope and requirement summary look right before I propose the architecture?”**
 
 ---
 
