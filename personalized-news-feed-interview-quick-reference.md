@@ -594,6 +594,61 @@ Stream consumers update recent User Feature Store values within minutes. Histori
 
 Choose from access patterns and consistency promises, not from “SQL versus NoSQL” as a slogan. One physical product may host several separate logical tables, but the User Feature Store and Content Feature Store remain distinct domains.
 
+#### Quick reference — SQL versus NoSQL and DynamoDB scaling
+
+The number of users is not, by itself, a reason to choose NoSQL. Start with the reads, writes, and invariants:
+
+| Prefer relational SQL when | Prefer a key-value/document store when |
+|---|---|
+| The main workflow needs joins, flexible queries, constraints, or multi-row transactions | The main workflow performs point or batch lookups using a known key |
+| Related records frequently change together | Most records can be read and updated independently |
+| Query flexibility is more important than a simple partition path | Predictable horizontal partitioning and high request throughput are dominant |
+
+For this news feed, the editorial source of truth may remain relational if editors need rich publisher/article workflows. The online serving path is different: ranking has already produced article IDs, so the Feed Service needs fast lookups such as `article-7 -> title, publisher, thumbnail, status`. A DynamoDB serving projection fits that access pattern:
+
+```text
+ContentMetadata table
+  PK: article_id
+  values: publisher_id, title, thumbnail_key, status,
+          language, region, expires_at, version
+```
+
+For one page, send one `BatchGetItem` containing the 20 ranked article IDs instead of issuing 20 sequential calls. DynamoDB supports up to 100 items in one batch, although a partial result can return `UnprocessedKeys`, which should be retried with bounded backoff. Batching reduces network round trips; it does not reduce the database capacity consumed by the item reads. See the [AWS `BatchGetItem` documentation](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchGetItem.html).
+
+Using the interview assumptions:
+
+```text
+23,000 peak page requests/second * 20 articles/page
+= 460,000 logical metadata item reads/second before caching
+```
+
+This calculation motivates horizontal distribution. DynamoDB hashes the high-cardinality `article_id` partition key and places different items on different storage partitions. It manages partitions automatically as storage and throughput grow. See [AWS DynamoDB partitions and data distribution](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html).
+
+Keep sharding and replication distinct:
+
+```text
+Sharding / partitioning                    Replication
+different data on different partitions    copies of the same data
+
+article-7 -> partition A                   article-7 -> copies across AZs
+article-9 -> partition B
+
+scales storage and request throughput      improves availability and durability
+```
+
+Both use more machines horizontally, but they solve different requirements. Sharding lets many partitions process different article IDs in parallel. Replication keeps the same data available when a server or Availability Zone fails. DynamoDB handles both inside a Region: it partitions the table and automatically replicates data across three Availability Zones, providing built-in high availability and durability. Multi-AZ replication is not cross-Region disaster recovery; use DynamoDB global tables only when the design requires cross-Region replicas. See [AWS DynamoDB resilience and disaster recovery](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/disaster-recovery-resiliency.html).
+
+Important limits and tradeoffs:
+
+- A breaking-news article is one `article_id`, so hashing cannot spread that single hot key across many partitions. Protect hot metadata with a regional cache and request coalescing; do not claim that sharding alone solves it.
+- DynamoDB can still throttle a hot partition or a traffic jump beyond available table capacity. Monitor throttling and partition skew, request quota increases or pre-warm when necessary, and retry only bounded transient failures. See [AWS DynamoDB partition-key guidance](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html) and [on-demand scaling behavior](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html).
+- Eventual reads may be acceptable for an article title but not necessarily for takedown status. Choose consistency per operation and keep the safety/suppression path authoritative. DynamoDB tables support optional strongly consistent reads, while global secondary indexes are eventually consistent. See [AWS DynamoDB read consistency](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html).
+- Maintaining both a relational source and a DynamoDB serving projection duplicates data and adds synchronization work. Use both only when the editorial and serving access patterns justify that cost.
+
+**Interview-ready answer:**
+
+> “I choose from access patterns, not merely from the number of users. Editorial workflows may use SQL for relationships and transactions, but the feed-serving path already knows the article IDs, so I publish an article-ID-keyed projection to DynamoDB and batch-read one page. DynamoDB shards different article IDs across partitions to scale storage and throughput, while it replicates the same data across three Availability Zones for availability and durability. A single popular article can still be a hot key, so I add caching and monitor throttling rather than claiming partitioning solves every load pattern.”
+
 | Data | Required behavior | Reasonable options | One defensible choice |
 |---|---|---|---|
 | Feed sessions | Very low latency, ordered IDs, TTL, disposable data | Redis-like distributed cache; key-value store with TTL | Redis-like cache because sessions are short-lived and rebuildable |
