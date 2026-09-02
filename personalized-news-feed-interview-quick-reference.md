@@ -280,18 +280,25 @@ Walk through one write path and one read path, explain why each specialized comp
 
 ---
 
-## How much API and schema detail should I include?
+## Step 3 — Deep-dive answer bank
 
-Do **not** design every endpoint and table automatically.
+Do not spend this step reciting every endpoint, table, or technology. Agree with the interviewer on one primary deep dive, explore it through the normal flow, bottleneck, invariant, failure, mitigation, and tradeoff, and use the other topics as prepared follow-ups.
 
-| Interview stage | Appropriate detail |
-|---|---|
-| Step 1 | No schema. Mention user-visible operations only. |
-| Step 2 | One or two endpoints and key entities when they clarify the flow. |
-| Step 3 | Show the API, record shape, indexes, and consistency behavior only for the chosen deep-dive path. |
-| Step 4 | Mention important omitted schemas or migrations as future work. |
+For a 20-minute Step 3, a strong default is:
 
-At high level, this is usually sufficient:
+1. **2 minutes:** confirm the deep-dive focus and restate the requirements it must protect.
+2. **8 minutes:** API, feed-session schema, pagination invariant, and hide/block correctness.
+3. **6 minutes:** candidate generation, batch ranking, and the latency budget.
+4. **3 minutes:** dependency failure and fallback behavior.
+5. **1 minute:** summarize the primary tradeoff and invite the next question.
+
+If the interviewer selects scale, feedback learning, multi-region availability, or database technology instead, use the corresponding prepared deep dive below. You will rarely present all six in one interview.
+
+### Deep dive 1 — Feed API, session schema, and pagination correctness
+
+This is the best primary deep dive because it connects the user-visible API to cache design, consistency, and correctness.
+
+#### API contract
 
 ```http
 GET /feed?cursor=<opaque-cursor>&limit=20
@@ -308,85 +315,21 @@ Authorization: Bearer <token>
       "thumbnail_url": "https://cdn.example/..."
     }
   ],
-  "next_page_token": "opaque-token"
+  "next_cursor": "opaque-signed-token"
 }
 ```
 
-For feedback, show that events are batched and idempotent:
+The authenticated user comes from the token, not a client-supplied `user_id`. Cap `limit`, for example at 50, so one request cannot create an unbounded hydration or ranking workload.
 
-```http
-POST /feed/events
-```
-
-```json
-{
-  "events": [
-    {
-      "event_id": "event-123",
-      "user_id": "user-42",
-      "article_id": "article-900",
-      "session_id": "session-88",
-      "event_type": "impression",
-      "position": 3,
-      "event_time": "2026-09-01T10:05:00Z",
-      "model_version": "model-v42"
-    }
-  ]
-}
-```
-
-The purpose of these examples is to clarify pagination, idempotency, and ML observability—not to turn the interview into an API review.
-
----
-
-## Step 3 — Deep-dive into the critical path
-
-Do not deep-dive into every box. Choose a boundary where scale, correctness, latency, and failure interact.
-
-For this problem, a strong choice is:
-
-> **Generating and preserving a personalized feed session when ranking, features, caches, or feedback state may be stale or unavailable.**
-
-Use this sequence:
-
-1. Normal path.
-2. Limiting resource or scale pressure.
-3. Correctness invariant.
-4. Failure mode.
-5. Mitigation.
-6. Cost or tradeoff.
-
-### Normal cache-miss path
+The opaque cursor logically contains or references:
 
 ```text
-GET /feed without a cursor
-  → load candidate pools and user state in parallel
-  → merge and hard-filter roughly 500 candidates
-  → load/join the necessary features
-  → batch-score candidates
-  → apply diversity and deduplication
-  → atomically create a session containing 200 ordered IDs
-  → hydrate the first 20 items
-  → return items and signed cursor
+session_id, next_scan_position, expires_at, signature
 ```
 
-### Example p95 latency budget
+The signature prevents clients from changing the session or offset. Bind the session to the authenticated user on the server.
 
-| Stage | Budget |
-|---|---:|
-| Edge, authentication, and routing | 15 ms |
-| Candidate pools and user state, in parallel | 45 ms |
-| Eligibility filtering and feature join | 25 ms |
-| Batch ranking | 70 ms |
-| Diversity and deduplication | 15 ms |
-| Session write and first-page hydration, in parallel | 45 ms |
-| Serialization and response | 20 ms |
-| **Planned total** | **235 ms** |
-| **Tail-latency headroom** | **65 ms** |
-
-Avoid assigning every stage an arbitrary 30–50 ms. The budget should reflect dependencies, parallel work, and the total p95 target.
-
-### Feed-session record
+#### Feed-session record
 
 ```text
 Key: feed_session:{user_id}:{session_id}
@@ -400,58 +343,202 @@ Value:
   ttl: 15–30 minutes
 ```
 
-Treat the ordered list as immutable. The opaque cursor identifies the session version and the next position to **scan**.
+Create the record atomically and treat the ordered list as immutable. For an existing cursor, do not re-rank the remaining items; scan the saved order.
 
-When a user hides a publisher after page one:
+If the reader hides a publisher after page one:
 
 1. Read page two from the original ordered session.
-2. Filter against the latest suppression/takedown state.
+2. Check the latest suppression and takedown state.
 3. Skip invalid IDs and overfetch until 20 valid unseen articles are collected.
 4. Advance the cursor past every examined ID, including skipped IDs.
 
-This preserves stable ordering without returning newly forbidden items or introducing duplicates.
+This preserves stable order and avoids duplicates while enforcing a newly written hide. The tradeoff is that a new article normally waits for refresh or a new session instead of appearing halfway through pagination.
 
-### Storage choices from access patterns
+**Prepared answer:**
 
-| Data | Access pattern | Example store |
-|---|---|---|
-| Active session | Short-lived ordered IDs, list slicing, TTL | Redis-like cache |
-| Content metadata | Batch lookup by article ID | Managed key-value/document store |
-| User features | Lookup by user ID; frequent behavior-driven updates; privacy lifecycle | Online feature table or low-latency key-value store |
-| Content features | Batch lookup by article IDs; ingestion-driven updates; shared across users | Separate online feature table or low-latency key-value store |
-| User preferences | Lookup/update by user ID; read-your-writes for hides | Durable key-value/document store plus cache |
-| Candidate pool | Lookup by region, language, segment, and version | Key-value store or cache |
-| Media | Large immutable objects | Object storage plus CDN |
-| Feedback | High-throughput append and replay | Event stream plus data lake |
+> “I use a server-side immutable session because an offset into a newly ranked list is unstable. The signed cursor identifies the session and next scan position. I apply current hard suppressions on every page and advance over skipped IDs, which preserves no-duplicate pagination without returning newly forbidden content.”
 
-Do not say “NoSQL because it scales.” State the access pattern, partition key, consistency promise, expected data size, and failure behavior.
+### Deep dive 2 — Hybrid personalization and low-latency serving
 
-### Fallback hierarchy
+For a cache miss or new feed session:
 
 ```text
-Existing cursor
-  → current immutable session
-
-New session with healthy Ranking Service
-  → personalized candidate generation and ranking
-
-Ranking Service timeout or Feature Store read failure
-  → recent complete personalized snapshot, if sufficiently fresh
-  → otherwise precomputed regional/segment popular pool
-
-Session cache unavailable
-  → filtered regional popular pool
-  → create a replacement session when storage recovers
+load shared candidate pools, user features, and preferences in parallel
+  → merge and deduplicate roughly 500 candidate IDs
+  → apply hard eligibility filters
+  → batch-load content features
+  → batch-score candidates in the Ranking Service
+  → apply diversity and canonical-story deduplication
+  → save the top 200 IDs as one session
+  → hydrate only the first 20 items
 ```
 
-Even during fallback, enforce safety, takedown, region/language, expiry, and explicit user suppression.
+The system does not score every article for every request. Offline and nearline workers prepare reusable pools by region, language, topic, publisher, recency, and popularity. Online work is bounded to a few hundred candidates and adds per-user and request-context signals.
 
-### Other strong deep-dive alternatives
+#### Example p95 latency budget
 
-- Article activation and fast takedown across indexes, pools, caches, and sessions.
-- Event delivery, idempotency, ordering, backlog, and online-feature freshness.
-- Multi-region serving and the consistency boundary for user suppressions.
-- Model rollout, training-serving skew, feature versioning, and experimentation.
+| Stage | Budget |
+|---|---:|
+| Edge, authentication, and routing | 15 ms |
+| Candidate pools, user features, and preferences in parallel | 45 ms |
+| Eligibility filtering and content-feature batch read | 25 ms |
+| Batch ranking | 70 ms |
+| Diversity and deduplication | 15 ms |
+| Session write and first-page hydration in parallel | 45 ms |
+| Serialization and response | 20 ms |
+| **Planned total** | **235 ms** |
+| **Tail-latency headroom** | **65 ms** |
+
+Use request deadlines shorter than the overall API deadline. Batch feature and metadata reads, parallelize independent work, avoid per-candidate RPCs, and hydrate only the returned page.
+
+**Prepared answer:**
+
+> “The main latency decision is a hybrid design: shared pools provide recall cheaply, while online ranking personalizes only a bounded candidate set. Parallel reads and batch inference keep the critical path predictable. The cost is slightly lower recall than scoring the whole corpus, but it meets the p95 target at much lower compute cost.”
+
+### Deep dive 3 — Scaling to millions of readers
+
+The scale assumptions imply approximately 23K peak feed QPS and 4B logical impressions per day. No single database choice solves this; the design must bound work, partition state, and move high-volume writes off the serving path.
+
+| Component | Scaling decision | Partition or cache key |
+|---|---|---|
+| Feed Service | Stateless replicas behind a load balancer; autoscale by QPS and latency | No local authoritative state |
+| Feed Session Cache | Shard short-lived sessions across cache nodes | Hash of `user_id + session_id` |
+| User Feature Store | Distribute independent per-user reads and updates | `user_id` |
+| Content Feature Store | Batch-read reusable features across candidates | `article_id` |
+| Candidate Pool Store | Precompute versioned shared pools; replicate hot pools | `region + language + segment + version` |
+| Content Metadata Store | Batch-get only the current page | `article_id` |
+| Event Stream | Batch impressions and partition for per-user ordering | `user_id`; deduplicate by `event_id` |
+
+Important scale techniques:
+
+- Do not fan out and materialize a full feed for every user whenever an article is published.
+- Precompute shared candidate pools, then perform bounded online personalization.
+- Batch 20 impression records into one client request and stream message when practical.
+- Replicate or locally cache hot regional pools; avoid one mutable global popularity key.
+- Protect cold-cache recovery with request coalescing, admission control, TTL jitter, and stale-while-revalidate behavior.
+- Monitor partition skew, cache hit rate, batch size, inference utilization, and stream backlog rather than only total QPS.
+
+**Prepared answer:**
+
+> “I scale the read path horizontally because the Feed Service is stateless. User-owned state partitions naturally by user ID, content by article ID, and shared pools by region and segment. The key optimization is architectural: reuse precomputed pools and rank only hundreds of candidates, while batching billions of feedback records through an asynchronous stream.”
+
+### Deep dive 4 — High availability, fallback, and multi-region behavior
+
+Run stateless serving components across multiple availability zones. Give each synchronous dependency a timeout, bounded retry policy, circuit breaker, and degraded path. Keep feed serving independent from the feedback and training pipelines.
+
+| Failure | Serving behavior | Tradeoff |
+|---|---|---|
+| Ranking Service timeout | Use a recent complete personalized snapshot, otherwise a regional/segment popular pool | Lower relevance |
+| User Feature Store or Content Feature Store timeout | Use a recent complete snapshot or popularity fallback; do not assemble partially scored results | Staler personalization |
+| Feed Session Cache loss | Return a filtered popular feed and create a replacement session after recovery | Session order may restart |
+| Partial metadata batch read | Skip missing items and overfetch replacements | Smaller page if too many records fail |
+| Event Stream backlog | Continue serving; delay passive-feature learning and alert on freshness lag | Recommendations learn more slowly |
+| Regional outage | Route to another healthy region with replicated content and pools | Higher latency and possibly stale user state |
+
+Fallback hierarchy:
+
+```text
+existing healthy session
+  → freshly ranked personalized session
+  → recent complete personalized snapshot
+  → precomputed regional or segment popular pool
+  → small verified editorial or emergency pool
+```
+
+Fallback may reduce relevance, but it must still enforce safety, takedown, expiry, region/language eligibility, and explicit user suppressions. If the authoritative safety state is unavailable, prefer a small previously verified pool instead of serving unknown content.
+
+For Japan and US traffic, keep content metadata, active candidate pools, models, and media available in both serving regions. Assign users a home region for feature and preference writes. A failover region may temporarily use replicated or stale soft-preference data, but hard takedown and suppression paths need faster replication or conservative filtering.
+
+**Prepared answer:**
+
+> “Availability comes from failure isolation and graceful degradation, not only replicas. Ranking and learning are optional for serving; policy checks are not. I deploy across zones, use strict dependency deadlines, and fall back through complete known-good feeds while preserving safety and explicit blocks.”
+
+### Deep dive 5 — Feedback ingestion and continuous learning
+
+Passive engagement is high-volume and asynchronous, but an explicit hide or block is user-visible correctness and should have a faster durable write path.
+
+#### Batched engagement API
+
+```http
+POST /feed/events
+Authorization: Bearer <token>
+Idempotency-Key: <request-id>
+```
+
+```json
+{
+  "events": [
+    {
+      "event_id": "event-123",
+      "article_id": "article-900",
+      "session_id": "session-88",
+      "event_type": "impression",
+      "position": 3,
+      "event_time": "2026-09-01T10:05:00Z",
+      "model_version": "model-v42"
+    }
+  ]
+}
+```
+
+The Event Collection Service derives `user_id` from authentication, validates and enriches the event, and appends it to the Event Stream. Partition by `user_id` when per-user order matters. Assume at-least-once delivery and make consumers idempotent using `event_id`; do not claim end-to-end exactly-once processing without defining the boundary.
+
+#### Explicit suppression API
+
+```http
+PUT /feed/preferences/suppressions/publisher-77
+Authorization: Bearer <token>
+```
+
+The Preference Service durably writes the suppression before acknowledging it, invalidates or updates its cache, and publishes a feedback event for features, analytics, and model training. Feed page reads check the latest suppression state even when the session was created earlier.
+
+Stream consumers update recent User Feature Store values within minutes. Historical events flow to the Event Data Lake, where the Model Training Pipeline constructs versioned datasets, evaluates a new model, registers it, and rolls it out through canary or A/B testing. Record `model_version`, position, and candidate context so offline evaluation can distinguish model behavior from presentation bias.
+
+**Prepared answer:**
+
+> “I separate passive learning events from explicit preference correctness. Impressions and clicks are batched and processed at least once with idempotent consumers. A hide is synchronously persisted through the Preference Service, then also emitted as an event, so a delayed learning pipeline cannot cause the hidden publisher to reappear.”
+
+### Deep dive 6 — Storage technologies and why
+
+Choose from access patterns and consistency promises, not from “SQL versus NoSQL” as a slogan. One physical product may host several separate logical tables, but the User Feature Store and Content Feature Store remain distinct domains.
+
+| Data | Required behavior | Reasonable options | One defensible choice |
+|---|---|---|---|
+| Feed sessions | Very low latency, ordered IDs, TTL, disposable data | Redis-like distributed cache; key-value store with TTL | Redis-like cache because sessions are short-lived and rebuildable |
+| Content metadata | Batch lookup by `article_id`, high read volume, simple state transitions | DynamoDB-like key-value/document store; Cassandra-like wide-column store; sharded SQL | Managed key-value/document store for the serving copy; use conditional state updates for activation |
+| User preferences | Durable writes by `user_id`, read-your-writes for hides, small records | Key-value/document store; relational database | Durable key-value/document store plus cache; request a consistent read after a recent hide when necessary |
+| User features | Low-latency lookup by `user_id`, frequent incremental updates | Online feature store backed by key-value/wide-column storage | Separate user-feature table in the online feature platform |
+| Content features | Batch lookup by `article_id`, shared across users, versioned features | Online feature store backed by key-value/wide-column storage | Separate content-feature table in the same platform if isolation is sufficient |
+| Candidate pools | Versioned list lookup by region/language/segment; hot reads | Durable key-value store with cache; wide-column store | Durable versioned pool plus Redis-like regional cache |
+| Feedback events | Append, partition, replay, absorb bursts | Kafka-like log; managed streaming service | Partitioned durable event stream keyed by `user_id` |
+| Historical events and media | Cheap durable object retention | Object storage | Separate object-storage buckets and lifecycle policies |
+
+Example logical keys:
+
+```text
+Content Metadata Store:  PK = article_id
+User Feature Store:      PK = user_id, feature/model version in the value
+Content Feature Store:   PK = article_id, feature/model version in the value
+Preference Store:        PK = user_id, SK = suppression_type#target_id
+Candidate Pool Store:    PK = region#language#segment, SK = pool_version
+Feed Session Cache:      key = user_id#session_id
+Event Stream:            partition key = user_id, idempotency key = event_id
+```
+
+SQL remains valid when publisher workflows require rich relationships, flexible editorial queries, or multi-record transactions. A common answer is to keep a relational editorial source of truth and publish an article-ID-keyed serving view. Only introduce both if the additional operational complexity solves a stated requirement.
+
+**Prepared answer:**
+
+> “I would use a small polyglot set: a Redis-like cache for rebuildable sessions, a durable key-value/document store for serving metadata and preferences, separate logical online feature tables, a partitioned event stream, and object storage for media and training history. Each choice follows its access pattern; I would not create a different database product for every box.”
+
+### API and schema depth rule
+
+- **Step 1:** name user-visible operations; do not draw schemas.
+- **Step 2:** name the main API boundary and key entities only if they clarify a flow.
+- **Step 3:** show the request/response, key fields, primary or partition key, consistency promise, and failure behavior for the selected deep dive.
+- **Step 4:** identify omitted schemas, migrations, or technology refinements as future work.
+
+The API and schema are supporting evidence for a design decision. They are not separate checklist sections that must consume interview time.
 
 ---
 
