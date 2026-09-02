@@ -1,8 +1,16 @@
-# Personalized News Feed — System Design Interview Quick Reference
+# System Design Interview Quick Reference
 
 This is an interview guide, not a single “correct” production architecture. The goal is to demonstrate how you resolve ambiguity, establish scope, propose a coherent design, defend tradeoffs, investigate one risky area deeply, and close the interview clearly.
 
-The running problem is:
+The guide contains three peer examples. The personalized news feed is the detailed running example for the four-step framework; the emergency-alert and YouTube sections apply the same reasoning at a more compact quick-reference depth.
+
+| Example | Dominant requirement | Core mechanism | Best deep dive |
+|---|---|---|---|
+| Personalized news feed | Relevant, stable, low-latency feed for millions of readers | Bounded candidate generation plus `ranking_score = f(user_features, content_features, request_context)`, immutable feed sessions, and safe fallback | Ranking and stable cursor pagination |
+| Geo-targeted emergency alerts | Deliver urgent, geographically relevant alerts within seconds during extreme fanout | Pre-index users by spatial cell, map alert polygons to cells, then use priority fanout with versioning and deduplication | Spatial targeting and notification-storm correctness |
+| YouTube on-demand and live video | Move enormous media volume while preserving playback quality; for live, keep processing synchronized with wall-clock time | Direct object upload, transcoded bitrate ladder, aligned segments and manifests, CDN delivery; live adds regional ingest and deadline-bound real-time encoding | Adaptive delivery, viral fanout, or real-time encoding |
+
+The detailed running problem is:
 
 > Design a backend that produces a personalized news feed for millions of readers. It should incorporate machine-learning ranking, react to user feedback, admit fresh articles quickly, and remain available at low latency when personalization components fail.
 
@@ -837,6 +845,346 @@ Personalization core:
   user behavior     → user features
   current request   → context
   all three         → Ranking Service → Feed Policy Module → feed session
+```
+
+---
+
+## Peer example — Geo-targeted emergency news and earthquake alerts
+
+### Step 1 — Scope and requirements
+
+Assume the system receives an already detected and authorized emergency event. Detecting earthquakes from raw sensors is a separate upstream problem.
+
+**Functional requirements:**
+
+- Accept a verified alert containing a source event ID, affected region, severity, localized message, version, and expiry.
+- Identify users currently in, subscribed to, or associated with the affected region.
+- Send push notifications and process meaningful corrections or cancellations.
+- Respect user preferences where policy permits and suppress accidental duplicate delivery.
+
+**Prioritized non-functional requirements:**
+
+- **Latency:** begin provider delivery within seconds for critical alerts.
+- **Availability and burst tolerance:** one small event may produce millions of notifications during an infrastructure disruption.
+- **Relevance:** minimize missed affected users while controlling false-positive targeting near geographic boundaries.
+- **Retry correctness:** use at-least-once processing with idempotent consumers, versions, and deduplication.
+- **Privacy:** store only the location precision, source, and retention required for targeting.
+
+Illustrative shape:
+
+```text
+50 million users
+one major event may target 5 million users
+one alert write → millions of delivery jobs
+```
+
+Important invariants:
+
+- An older alert version must never overwrite a newer correction or cancellation.
+- An expired alert must not be sent merely because it remained in a backlog.
+- A queue redelivery must not become an uncontrolled duplicate notification.
+- APNs or FCM acceptance means accepted by the provider, not necessarily seen by the person.
+
+### Step 2 — High-level design
+
+```mermaid
+flowchart LR
+    Source[Trusted Authority or Editor] --> Ingest[Alert Ingestion and Validation]
+    Ingest --> Alerts[(Versioned Alert Store)]
+    Location[Location or Region Subscription Service] --> Cells[(Spatial Cell Membership Index)]
+    Alerts --> Targeter[Geo Targeter]
+    Cells --> Targeter
+    Targeter --> Critical[[Critical Fanout Queue]]
+    Targeter --> Normal[[Normal News Queue]]
+    Critical --> Workers[Notification Workers]
+    Normal --> Workers
+    Workers --> Push[APNs and FCM]
+    Push --> Devices[User Devices]
+    Workers --> Delivery[(Delivery and Deduplication Store)]
+```
+
+One concrete example:
+
+```text
+Aya  → Tokyo cell T-17
+Ben  → Osaka cell O-04
+Chen → Yokohama cell Y-09
+
+Alert polygon covers T-17 and Y-09
+candidate users = [Aya, Chen]
+Ben is not selected
+```
+
+The component responsibilities are:
+
+1. **Alert ingestion** authenticates the source, validates the polygon and timestamps, deduplicates producer retries by `source_event_id`, assigns `alert_id`, and stores the accepted version before fanout.
+2. **Versioned alert store** is the durable source of truth for region, severity, localized message, expiry, and `ACTIVE` or `CANCELLED` state.
+3. **Spatial-cell membership index** precomputes reverse lookups such as `T-17 → [Aya, ...]`. Recent-location memberships carry timestamps and TTLs; explicit home-region subscriptions may be durable.
+4. **Geo targeter** converts the alert polygon into a hierarchical cell cover, unions the users associated with those cells, performs precise checks around boundary cells when needed, applies policy and preferences, and emits eligible recipient work.
+5. **Priority fanout queues** turn one alert into many buffered jobs. Separate critical and ordinary lanes prevent life-safety alerts from waiting behind marketing or recommendation traffic.
+6. **Queue partitioning by `user_id`** distributes work across workers and makes per-user ordering easier; version and deduplication checks are still required.
+7. **Notification workers** recheck the latest version and expiry, load device tokens and locale, render the payload, call APNs or FCM, retry bounded transient failures, and record the result.
+
+### Step 3 — Core deep dive: spatial targeting and fanout
+
+Use a hierarchical spatial index such as an S2-, H3-, or geohash-like grid. The product-specific name matters less than the mechanism:
+
+```text
+affected_cells = spatial_cover(alert_polygon)
+candidate_users = union(cell_members[cell] for cell in affected_cells)
+eligible_users = filter(candidate_users, exact_boundary, freshness, policy, preferences)
+```
+
+Cells avoid scanning every user's latitude and longitude after an emergency. A mixed-resolution cover can use coarse cells inside a large region and finer cells around its boundary. The cell lookup favors recall; an exact point-in-polygon check on boundary candidates improves precision.
+
+Fanout then converts one accepted alert into millions of independently processable jobs:
+
+```text
+one alert
+  → job for Aya
+  → job for Chen
+  → ...millions more
+```
+
+A queue trades immediate completion for buffering and independent progress. If five million jobs arrive but workers can send only 100,000 per second, the backlog waits durably. Scale workers from queue age and depth, reserve capacity for critical traffic, apply provider-aware rate limits, and use backpressure rather than exhausting memory.
+
+Use a deduplication identity such as:
+
+```text
+(alert_id, alert_version, user_id, channel)
+```
+
+A repeated version is a duplicate; a higher version is a meaningful correction. Because a worker may call a provider and crash before recording success, server-side exactly-once delivery is not generally provable across the complete path. Make retries safe and add device-side alert/version suppression.
+
+Useful failure checks:
+
+| Failure | Response | Tradeoff or limitation |
+|---|---|---|
+| Source retries the same event | Idempotency by `source_event_id` | Requires durable ingestion record |
+| Cell cover selects users outside the polygon | Precise check for boundary-cell candidates | Additional targeting compute |
+| Old jobs remain after version 2 or cancellation | Worker rereads latest state and compares versions | Extra critical-path lookup or cached state |
+| FCM or APNs slows down | Queue, provider-specific backoff, rate limits, expiry checks | Backlog grows; ordinary mobile push has no hard real-time guarantee |
+| Worker or queue redelivers a job | Deduplication key plus device-side version suppression | An ambiguous provider outcome can still require reconciliation |
+
+**Interview-ready answer:**
+
+> “I store and version the authenticated alert before delivery, convert its affected polygon into hierarchical geographic cells, and use a prebuilt cell-to-user index to find candidates without scanning every user. After precise boundary and policy filtering, I create priority fanout jobs partitioned by user ID. Notification workers recheck version and expiry, call APNs or FCM, and use at-least-once processing with deduplication. The primary tradeoff is targeting accuracy versus location privacy and fanout cost.”
+
+Memory hook:
+
+```text
+Index the audience before the crisis
+  → polygon to cells
+  → cells to users
+  → priority fanout
+  → versioned, retry-safe delivery
+```
+
+---
+
+## Peer example — YouTube on-demand video and live streaming
+
+### Step 1 — Scope and requirements
+
+For the on-demand design, keep the interview focused on resumable upload, asynchronous media processing, and adaptive playback. Treat live streaming as an explicit extension because it replaces offline preparation with a deadline-bound continuous pipeline.
+
+**On-demand functional requirements:**
+
+- A creator uploads and resumes a large video.
+- The system prepares playable formats and exposes `UPLOADING`, `PROCESSING`, `PLAYABLE`, or `FAILED` status.
+- A viewer plays the video across devices and changing network conditions.
+- Store small metadata such as owner, title, visibility, duration, thumbnail, and manifest location.
+
+**On-demand non-functional requirements:**
+
+- A completed upload is durable.
+- Playback begins quickly and minimizes rebuffering.
+- Popular videos remain available globally.
+- Storage, transcoding compute, and especially media egress remain economical.
+
+Workload observation:
+
+```text
+video watches >> video uploads
+media bytes >> metadata bytes
+```
+
+The conclusion is more important than a memorized estimate: keep large media bytes away from application servers, store them as objects, and serve repeated bytes through a CDN.
+
+### Step 2 — On-demand high-level design
+
+```mermaid
+flowchart LR
+    Creator --> API[Metadata and Upload Service]
+    API --> Metadata[(Video Metadata Database)]
+    API -->|short-lived signed multipart URLs| Creator
+    Creator -->|video parts and checksums| Raw[(Raw Object Storage)]
+    Raw --> Complete[[Upload Complete Event]]
+    Complete --> Workflow[Transcoding Workflow]
+    Workflow --> Transcoders[Parallel Transcoding Workers]
+    Transcoders --> Processed[(Versioned Segments and Manifests)]
+    Workflow --> Metadata
+    Viewer --> Playback[Playback API]
+    Playback --> Metadata
+    Playback -->|authorized manifest URL| Viewer
+    Viewer --> CDN[Nearby CDN Edge]
+    CDN --> Shield[Origin Shield]
+    Shield --> Processed
+```
+
+Separate the paths:
+
+- The **control plane** handles authentication, metadata, visibility, processing state, and playback authorization.
+- The **media data plane** moves originals and segments among clients, object storage, transcoders, and CDNs.
+
+Example preparation output for one 60-second 4K upload:
+
+```text
+360p at 0.8 Mbps → about 15 four-second segments
+720p at 2.5 Mbps → about 15 four-second segments
+1080p at 5 Mbps  → about 15 four-second segments
+master manifest  → describes variants and segment locations
+```
+
+Core flow:
+
+1. `POST /videos` creates `video_id` and `UPLOADING` metadata.
+2. The client uploads checksummed parts directly to object storage through signed URLs; interruption resumes from completed parts.
+3. Durable completion emits an idempotent event keyed by `video_id + upload_version`.
+4. A retryable workflow validates media, extracts metadata, makes thumbnails, encodes a bitrate ladder, creates aligned segments, and finally builds a manifest.
+5. Change status to `PLAYABLE` only after the minimum advertised segments and manifest are durable.
+6. The viewer obtains authorized control data from the Playback API but retrieves the large segments from a CDN.
+
+Publication invariant:
+
+> Never publish a manifest that advertises a segment that is not already durable and readable.
+
+### Step 3 — Core on-demand deep dive
+
+The central idea is **preprocess once, serve many times near the viewer**:
+
+- A complete original file permits expensive asynchronous work before publication.
+- A bitrate ladder provides multiple resolution, codec, and bitrate choices.
+- Short, time-aligned segments let the player change quality between segments.
+- The player selects a safe next bitrate from estimated throughput and current buffer occupancy.
+- Versioned immutable segment URLs permit long-lived and safe CDN caching.
+- Edge caches and an origin shield protect object storage when a video becomes viral.
+
+Conceptually:
+
+```text
+chosen_bitrate < safety_factor × estimated_throughput
+```
+
+Smooth lower-quality playback is normally better than high-resolution playback that repeatedly freezes. Shorter segments adapt faster but create more requests and packaging overhead; more precomputed renditions improve playback but consume more compute and storage.
+
+Failure checks:
+
+| Failure | Response |
+|---|---|
+| Upload connection breaks | Resume from completed multipart chunks |
+| Completion event is delivered twice | Idempotent workflow keyed by video ID and upload version |
+| One encoder crashes | Retry only that recorded workflow stage |
+| Some high-quality variants are slow | Publish a minimum safe rendition, add variants later |
+| Video becomes viral | CDN edge caching, origin shield, and request coalescing |
+
+### Live extension — what changes
+
+The mental-model difference is:
+
+```text
+On demand: prepare, then serve
+Live:      prepare while serving
+```
+
+In live streaming, the complete file does not exist. The camera continuously produces frames, and the system must transform and distribute them while keeping pace with wall-clock time.
+
+```mermaid
+flowchart LR
+    Camera --> Local[Broadcast Device Hardware Encoder]
+    Local -->|one persistent compressed uplink| Ingest[Nearest Regional Ingest]
+    Ingest --> Transcode[Decode, Scale, and Real-Time Encode]
+    Transcode --> Ladder[Aligned 360p, 720p, and 1080p Renditions]
+    Ladder --> Packager[Segmenter and Live Packager]
+    Packager --> Manifest[(Sliding Live Manifest and Recent Segments)]
+    Manifest --> CDN[CDN or Media Edge]
+    CDN --> Viewers[Many Viewers]
+    Packager --> Archive[(Recording Object Storage)]
+```
+
+The latency target must be clarified first:
+
+- Large one-way broadcasts can use cacheable HTTP segments and accept seconds of delay.
+- Lower latency requires shorter or partial segments and smaller player buffers, trading away efficiency and stability.
+- Sub-second interactive products usually use persistent media sessions through WebRTC-like media servers or SFUs rather than ordinary CDN segment caching.
+
+### Core live deep dive — what makes real-time encoding possible
+
+The broadcaster does not normally upload raw camera frames. Illustratively, uncompressed 1080p RGB video at 30 frames per second is roughly:
+
+```text
+1920 × 1080 × 3 bytes × 30 ≈ 186 MB/s ≈ 1.5 Gbps
+```
+
+The phone, camera, GPU, or broadcasting software uses a hardware encoder to compress that into a source stream of only a few Mbps, then maintains one persistent connection to the ingest service.
+
+Video codecs work incrementally over groups of frames:
+
+- **I-frame:** independently decodable complete picture.
+- **P-frame:** describes changes relative to earlier frames.
+- **B-frame:** may reference earlier and future frames; improves compression but can add lookahead delay.
+
+At 30 fps, a frame arrives approximately every 33 ms. The pipeline's sustained throughput must remain at least 30 fps. Live encoders use hardware acceleration, a single fast pass, bounded lookahead, and fewer expensive future-frame dependencies. They sacrifice some compression efficiency for deadline compliance.
+
+Server-side transcoders decode the contribution stream, scale frames, and encode several renditions in parallel. All variants must align timestamps, segment boundaries, and keyframes:
+
+```text
+time       360p       720p       1080p
+00:00      keyframe   keyframe   keyframe
+00:02      keyframe   keyframe   keyframe
+00:04      keyframe   keyframe   keyframe
+```
+
+This alignment lets a viewer switch from a 1080p segment to the corresponding 360p segment without losing required reference frames.
+
+Live overload has a different rule from on-demand processing:
+
+> Do not accumulate an unlimited queue of stale frames. Scale capacity, use a faster preset, drop a high-quality rendition, or drop frames while preserving timing and the most important stream.
+
+The live manifest is a moving window:
+
+```text
+at 12:00:06 → segments 100, 101, 102
+at 12:00:08 → segments 101, 102, 103
+```
+
+The viewer normally does **not** connect directly to the broadcaster:
+
+```text
+large broadcast:
+broadcaster --persistent connection--> ingest
+viewer --repeated HTTPS segment requests--> CDN
+
+sub-second interactive:
+broadcaster --persistent media session--> media edge or SFU
+viewer      --persistent media session--> media edge or SFU
+```
+
+CDN fanout prevents a broadcaster or transcoder from maintaining millions of viewer connections. Recording the live segments to object storage allows the system to verify them, build a complete static manifest, and publish an ordinary on-demand replay after the stream ends.
+
+**Interview-ready answer:**
+
+> “For on-demand video, I separate metadata from media, upload large files directly and resumably to object storage, and use a durable asynchronous workflow to create aligned bitrate segments and a manifest before publication. Viewers obtain authorization from the control plane but fetch immutable segments through a CDN, while the player adapts bitrate from throughput and buffer conditions. For live streaming, the broadcaster first compresses camera frames locally and maintains one connection to regional ingest. Hardware-accelerated server encoders continuously produce keyframe-aligned renditions fast enough to keep pace with the source, and a packager exposes a sliding manifest through CDN or media edges. The core live tradeoff is compression efficiency and playback stability versus camera-to-viewer latency.”
+
+Memory hook:
+
+```text
+On demand:
+upload reliably → process asynchronously → cache near viewers → adapt playback
+
+Live:
+compress at broadcaster → process continuously → align qualities
+→ fan out through infrastructure → never queue stale frames indefinitely
 ```
 
 ---
